@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f7fb">
+  <title>新建翻译 · arXiv Translate</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="site-shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-icon" aria-hidden="true">文</span><span>arXiv <strong>Translate</strong></span></div>
+      <span class="local-badge"><span class="badge-dot"></span> 本地运行</span>
+    </header>
+
+    <main>
+      <div class="intro">
+        <span class="eyebrow">NEW TRANSLATION</span>
+        <h1>把 arXiv 论文，<br><span>翻译成可阅读的中文 PDF。</span></h1>
+        <p>上传论文、选择模型并填写 API Key。我们会查找对应版本的 LaTeX 源码，完成翻译与编译。</p>
+      </div>
+
+      <section class="task-card" aria-labelledby="task-heading">
+        <div class="card-heading"><span class="step-mark">01</span><div><h2 id="task-heading">新建翻译任务</h2><p>只需填写以下三项</p></div></div>
+        <form id="taskForm" novalidate>
+          <div class="form-section">
+            <label class="field-title" for="pdfInput">上传 arXiv 论文 PDF <span class="required">*</span></label>
+            <label class="dropzone" id="dropzone" for="pdfInput">
+              <input type="file" id="pdfInput" accept=".pdf,application/pdf" hidden>
+              <span class="upload-icon" aria-hidden="true">↑</span>
+              <strong id="fileTitle">点击选择 PDF，或拖拽到这里</strong>
+              <small id="fileHint">支持带版本号的 arXiv 论文 · 最大 25 MB</small>
+            </label>
+          </div>
+
+          <div class="field-row">
+            <div class="form-section">
+              <label class="field-title" for="model">翻译模型 <span class="required">*</span></label>
+              <select id="model" name="model">
+                <option value="deepseek-flash">DeepSeek Flash</option>
+                <option value="gpt-4o-mini">OpenAI GPT-4o mini</option>
+              </select>
+              <small class="field-help">模型调用按服务商的用量计费。</small>
+            </div>
+            <div class="form-section">
+              <label class="field-title" for="apiKey">API Key <span class="required">*</span></label>
+              <div class="key-wrap"><input id="apiKey" type="password" placeholder="输入所选模型的 API Key" autocomplete="off" spellcheck="false"><button id="toggleKey" type="button" aria-label="显示 API Key">显示</button></div>
+              <small class="field-help">仅用于本次任务，不会保存在浏览器或项目文件中。</small>
+            </div>
+          </div>
+
+          <p id="formError" class="error-message" role="alert" hidden></p>
+          <div class="submit-row"><span class="privacy-note">◈ 论文与密钥由本机服务处理</span><button id="submitButton" class="primary-button" type="submit">开始翻译 <span aria-hidden="true">→</span></button></div>
+        </form>
+      </section>
+
+      <section id="progressCard" class="progress-card" aria-live="polite" hidden>
+        <div class="card-heading"><span class="step-mark">02</span><div><h2>翻译进度</h2><p id="paperLabel">正在处理论文</p></div><span id="statePill" class="state-pill">进行中</span></div>
+        <ol class="progress-list">
+          <li data-step="source"><span class="progress-icon">1</span><div><strong>匹配源码</strong><small>查找相同版本的 arXiv LaTeX 文件</small></div></li>
+          <li data-step="baseline"><span class="progress-icon">2</span><div><strong>原文编译检查</strong><small>确认源码可以在本机编译</small></div></li>
+          <li data-step="translating"><span class="progress-icon">3</span><div><strong>翻译论文</strong><small id="translateDetail">保护公式与引用，翻译正文</small></div></li>
+          <li data-step="compiling"><span class="progress-icon">4</span><div><strong>生成中文 PDF</strong><small>编译并准备预览文件</small></div></li>
+        </ol>
+        <p id="taskMessage" class="task-message"></p>
+      </section>
+
+      <section id="resultCard" class="result-card" hidden>
+        <div class="result-heading"><div><span class="eyebrow">TRANSLATION READY</span><h2>中文 PDF 已生成</h2><p id="resultSummary">请检查译文、公式与排版。</p></div><a id="downloadLink" class="primary-button" href="#" download>下载 PDF <span aria-hidden="true">↓</span></a></div>
+        <iframe id="pdfPreview" title="中文 PDF 预览"></iframe>
+        <p class="review-note">自动编译成功不代表译文准确；使用前请人工检查公式、图表、参考文献及格式。</p>
+      </section>
+    </main>
+    <footer>arXiv Translate · 本地论文翻译工具</footer>
+  </div>
+</body>
+</html>
