@@ -39,15 +39,23 @@
             <div class="form-section">
               <label class="field-title" for="model">翻译模型 <span class="required">*</span></label>
               <select id="model" name="model">
-                <option value="deepseek-flash">DeepSeek Flash</option>
-                <option value="gpt-4o-mini">OpenAI GPT-4o mini</option>
+                <optgroup label="DeepSeek">
+                  <option value="deepseek-flash">DeepSeek Flash</option>
+                  <option value="deepseek-v4-pro">DeepSeek V4 Pro</option>
+                </optgroup>
+                <optgroup label="OpenAI">
+                  <option value="gpt-4o-mini">GPT-4o Mini</option>
+                  <option value="gpt-4.1-mini">GPT-4.1 Mini</option>
+                  <option value="gpt-4.1">GPT-4.1</option>
+                  <option value="gpt-4o">GPT-4o</option>
+                </optgroup>
               </select>
-              <small class="field-help">模型调用按服务商的用量计费。</small>
+              <small class="field-help">请选择与你的 API Key 对应的服务商；模型调用按服务商的用量计费。</small>
             </div>
             <div class="form-section">
               <label class="field-title" for="apiKey">API Key <span class="required">*</span></label>
               <div class="key-wrap"><input id="apiKey" type="password" placeholder="输入所选模型的 API Key" autocomplete="off" spellcheck="false"><button id="toggleKey" type="button" aria-label="显示 API Key">显示</button></div>
-              <small class="field-help">仅用于本次任务，不会保存在浏览器或项目文件中。</small>
+              <small class="field-help">Key 会保留在当前页面，方便继续翻译；刷新或关闭页面后不会由本程序保存。切换模型时请确认 Key 对应服务商。</small>
             </div>
           </div>
 

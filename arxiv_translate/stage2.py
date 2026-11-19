@@ -11,6 +11,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import Counter
 from pathlib import Path
 from typing import Callable
@@ -23,7 +24,7 @@ from .tex_segments import (PLACEHOLDER, Segment, apply_translations, extract_seg
 OPENAI_API_URL = "https://api.openai.com/v1/responses"
 DEEPSEEK_API_URL = "https://api.deepseek.com/responses"
 STATE_VERSION = 1
-EXTRACTOR_VERSION = 4
+EXTRACTOR_VERSION = 5
 SYSTEM_PROMPT = (
     "You translate academic English into accurate, fluent Simplified Chinese. "
     "Preserve technical meaning, numbers, names, and terminology. Each item has a text excerpt "
@@ -36,6 +37,30 @@ SYSTEM_PROMPT = (
 )
 
 
+class IncompleteTranslationBatch(RuntimeError):
+    """A model reply needs recovery, but some requested rows are usable."""
+
+    def __init__(self, valid: dict[str, str]):
+        super().__init__("Translation response omitted, duplicated, or added segment IDs")
+        self.valid = valid
+
+
+def _segments_for_version(source_dir: Path, main_tex: str, version: int,
+                          *, exclude: dict[str, tuple[tuple[int, int], ...]] | None = None
+                          ) -> list[Segment]:
+    segments: list[Segment] = []
+    for relative in reachable_tex(source_dir, main_tex, root_relative_inputs=version >= 5):
+        if not translatable_file(relative):
+            continue
+        text = (source_dir / relative).read_text(encoding="utf-8")
+        segments.extend(extract_segments(text, relative, main_file=relative == main_tex,
+                                         enhanced=version >= 2, modern=version >= 3,
+                                         preamble_metadata=version >= 4,
+                                         custom_text_commands=version >= 5,
+                                         exclude_ranges=(exclude or {}).get(relative, ())))
+    return segments
+
+
 def paper_plan(root: Path, paper_id: str) -> tuple[dict, Path, list[Segment]]:
     manifest = inventory(root)
     entry = next((item for item in manifest["papers"] if item["id"] == paper_id), None)
@@ -46,17 +71,16 @@ def paper_plan(root: Path, paper_id: str) -> tuple[dict, Path, list[Segment]]:
     checkpoint = root / "results" / "stage2" / paper_id / "translations.json"
     existing_state = json.loads(checkpoint.read_text(encoding="utf-8")) if checkpoint.is_file() else {}
     extractor_version = existing_state.get("extractor_version", 1 if existing_state else EXTRACTOR_VERSION)
-    enhanced = extractor_version >= 2
-    modern = extractor_version >= 3
     source_dir = root / entry["source_dir"]
-    segments: list[Segment] = []
-    for relative in reachable_tex(source_dir, entry["main_tex"]):
-        if not translatable_file(relative):
-            continue
-        text = (source_dir / relative).read_text(encoding="utf-8")
-        segments.extend(extract_segments(text, relative, main_file=relative == entry["main_tex"],
-                                         enhanced=enhanced, modern=modern,
-                                         preamble_metadata=extractor_version >= 4))
+    segments = _segments_for_version(source_dir, entry["main_tex"], extractor_version)
+    if extractor_version < 5:
+        covered: dict[str, list[tuple[int, int]]] = {}
+        for segment in segments:
+            covered.setdefault(segment.path, []).append((segment.start, segment.end))
+        extras = _segments_for_version(source_dir, entry["main_tex"], 5,
+                                       exclude={path: tuple(ranges)
+                                                for path, ranges in covered.items()})
+        segments.extend(extras)
     return entry, source_dir, segments
 
 
@@ -79,28 +103,65 @@ def _schema() -> dict:
     }
 
 
+def _single_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+        "additionalProperties": False,
+    }
+
+
+def _validated_translation(segment: Segment, value: object) -> str:
+    if not isinstance(value, str) or not value.strip() or "\x00" in value:
+        raise RuntimeError("Translation response contains an empty or invalid text item")
+    if "-part-" in segment.id and not segment.protected:
+        # Piecewise recovery reinserts protected tokens itself. Ignore tokens
+        # copied from context rather than from this particular piece.
+        value = PLACEHOLDER.sub("", value).strip()
+        if not value:
+            raise RuntimeError(f"Empty piecewise translation: {segment.id}")
+    if len(value) > max(500, len(segment.text) * 3):
+        raise RuntimeError(f"Translation is unexpectedly long: {segment.id}")
+    render_translation(segment, value)
+    return value
+
+
 def _responses_translate_batch(segments: list[Segment], model: str, *,
                                provider: str, api_url: str, api_key_env: str,
-                               disable_reasoning: bool = False) -> dict[str, str]:
+                               disable_reasoning: bool = False,
+                               single_text: bool = False) -> dict[str, str]:
     key = os.environ.get(api_key_env)
     if not key:
         raise ValueError(f"{api_key_env} is not set; no translation request was sent")
+    if single_text and len(segments) != 1:
+        raise ValueError("Single-text translation requires exactly one segment")
+    if single_text:
+        user_content = {"text": segments[0].text,
+                        "context_before": segments[0].context_before,
+                        "context_after": segments[0].context_after}
+        system_prompt = ("Translate only the text field into accurate Simplified Chinese. "
+                         "Use context only for understanding. Preserve every [[LATEX_N]] token "
+                         "exactly once, unchanged and in order. Return one translated text field "
+                         "without LaTeX commands, Markdown, or explanation.")
+        response_schema = _single_schema()
+    else:
+        user_content = {"translations_required": [
+            {"id": s.id, "text": s.text,
+             "context_before": s.context_before, "context_after": s.context_after}
+            for s in segments]}
+        system_prompt = SYSTEM_PROMPT
+        response_schema = _schema()
     payload = {
         "model": model,
         "store": False,
         "max_output_tokens": 6000,
         "input": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(
-                {"translations_required": [{"id": s.id, "text": s.text,
-                                             "context_before": s.context_before,
-                                             "context_after": s.context_after}
-                                            for s in segments]},
-                ensure_ascii=False,
-            )},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_content, ensure_ascii=False)},
         ],
         "text": {"format": {"type": "json_schema", "name": "latex_translation_batch",
-                            "strict": True, "schema": _schema()}},
+                            "strict": True, "schema": response_schema}},
     }
     if disable_reasoning:
         payload["reasoning"] = {"effort": "none"}
@@ -125,6 +186,8 @@ def _responses_translate_batch(segments: list[Segment], model: str, *,
             if attempt == 2:
                 raise RuntimeError(f"{provider} API returned invalid JSON") from error
             time.sleep(2 ** attempt)
+    if body.get("status") == "incomplete":
+        raise IncompleteTranslationBatch({})
     if body.get("status") != "completed":
         raise RuntimeError(f"{provider} response not completed: {body.get('status')}")
     output_texts: list[str] = []
@@ -137,29 +200,40 @@ def _responses_translate_batch(segments: list[Segment], model: str, *,
             if content.get("type") == "output_text":
                 output_texts.append(content["text"])
     if len(output_texts) != 1:
-        raise RuntimeError("Expected one structured translation response")
+        raise IncompleteTranslationBatch({})
     parsed = json.loads(output_texts[0])
-    rows = parsed.get("translations")
-    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-        raise RuntimeError("Invalid translation response structure")
-    translations = {row.get("id"): row.get("text") for row in rows}
-    expected = {segment.id for segment in segments}
-    if set(translations) != expected or len(rows) != len(expected):
-        raise RuntimeError("Translation response omitted, duplicated, or added segment IDs")
-    if any(not isinstance(value, str) or not value.strip() or "\x00" in value
-           for value in translations.values()):
-        raise RuntimeError("Translation response contains an empty or invalid text item")
-    for segment in segments:
-        if "-part-" in segment.id and not segment.protected:
-            # Piecewise recovery reinserts all protected tokens itself. Models
-            # sometimes echo a token seen in nearby context; discard that echo.
-            translations[segment.id] = PLACEHOLDER.sub("", translations[segment.id]).strip()
-            if not translations[segment.id]:
-                raise RuntimeError(f"Empty piecewise translation: {segment.id}")
-        if len(translations[segment.id]) > max(500, len(segment.text) * 3):
-            raise RuntimeError(f"Translation is unexpectedly long: {segment.id}")
-        render_translation(segment, translations[segment.id])
-    return translations
+    if not isinstance(parsed, dict):
+        raise IncompleteTranslationBatch({})
+    if single_text:
+        translations = {segments[0].id: parsed.get("text")}
+    else:
+        rows = parsed.get("translations")
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise IncompleteTranslationBatch({})
+        if len(segments) == 1 and len(rows) == 1:
+            # One requested row is unambiguous even if the model rewrites its ID.
+            translations = {segments[0].id: rows[0].get("text")}
+        else:
+            expected = {segment.id for segment in segments}
+            grouped: dict[str, list[object]] = {}
+            for row in rows:
+                row_id = row.get("id")
+                if isinstance(row_id, str) and row_id in expected:
+                    grouped.setdefault(row_id, []).append(row.get("text"))
+            valid: dict[str, str] = {}
+            for segment in segments:
+                values = grouped.get(segment.id, [])
+                if len(values) != 1:
+                    continue  # Missing or duplicated IDs must be requested again.
+                try:
+                    valid[segment.id] = _validated_translation(segment, values[0])
+                except (RuntimeError, ValueError):
+                    continue  # Never reuse malformed text or altered LaTeX tokens.
+            if len(valid) != len(segments):
+                raise IncompleteTranslationBatch(valid)
+            return valid
+    return {segment.id: _validated_translation(segment, translations[segment.id])
+            for segment in segments}
 
 
 def openai_translate_batch(segments: list[Segment], model: str) -> dict[str, str]:
@@ -173,22 +247,43 @@ def deepseek_translate_batch(segments: list[Segment], model: str) -> dict[str, s
                                           api_url=DEEPSEEK_API_URL, api_key_env="DEEPSEEK_API_KEY",
                                           disable_reasoning=True)
 
+    def request_single(segment: Segment) -> dict[str, str]:
+        return _responses_translate_batch([segment], model, provider="DeepSeek",
+                                          api_url=DEEPSEEK_API_URL, api_key_env="DEEPSEEK_API_KEY",
+                                          disable_reasoning=True, single_text=True)
+
     try:
         return request(segments)
     except (ValueError, RuntimeError) as error:
+        if isinstance(error, IncompleteTranslationBatch) and error.valid:
+            pending = [segment for segment in segments if segment.id not in error.valid]
+            if not pending:
+                return error.valid
+            return {**error.valid, **deepseek_translate_batch(pending, model)}
         placeholder_error = "Protected LaTeX placeholders were changed" in str(error)
         missing_ids = "Translation response omitted, duplicated, or added segment IDs" in str(error)
         malformed_output = isinstance(error, json.JSONDecodeError)
-        if not (placeholder_error or missing_ids or malformed_output):
+        invalid_text = ("Translation response contains an empty or invalid text item" in str(error)
+                        or "Translation is unexpectedly long" in str(error))
+        if not (placeholder_error or missing_ids or malformed_output or invalid_text):
             raise
         if len(segments) > 1:
             middle = len(segments) // 2
             return {**deepseek_translate_batch(segments[:middle], model),
                     **deepseek_translate_batch(segments[middle:], model)}
-        if missing_ids or malformed_output:
-            return request(segments)
+        if missing_ids or malformed_output or invalid_text:
+            try:
+                return request_single(segments[0])
+            except ValueError as fallback_error:
+                if "Protected LaTeX placeholders were changed" not in str(fallback_error):
+                    raise
         segment = segments[0]
         markers = list(PLACEHOLDER.finditer(segment.text))
+        if not markers:
+            raise RuntimeError(
+                f"The model did not return a valid translation for segment {segment.id}; "
+                "the completed batches remain saved, so retry this task"
+            ) from error
         starts = [0] + [match.end() for match in markers]
         ends = [match.start() for match in markers] + [len(segment.text)]
         parts = [segment.text[a:b] for a, b in zip(starts, ends)]
@@ -206,7 +301,7 @@ def deepseek_translate_batch(segments: list[Segment], model: str) -> dict[str, s
             ))
         translated_parts: dict[str, str] = {}
         for batch in _batches(piece_segments):
-            translated_parts.update(request(batch))
+            translated_parts.update(deepseek_translate_batch(batch, model))
         rebuilt = "".join(
             translated_parts.get(f"{segment.id}-part-{index}", part) +
             (markers[index].group() if index < len(markers) else "")
@@ -237,12 +332,12 @@ def _batches(segments: list[Segment]):
 
 
 def _materialize(source_dir: Path, paper_dir: Path, segments: list[Segment],
-                 translations: dict[str, str]) -> Path:
+                 translations: dict[str, str], *, refresh: bool = False) -> Path:
     paper_dir.mkdir(parents=True, exist_ok=True)
     target = paper_dir / "translated"
     if target.is_symlink():
         raise ValueError("Translated output path is a symlink")
-    if target.exists():
+    if target.exists() and not refresh:
         return target
     temporary = Path(tempfile.mkdtemp(prefix="translated-", dir=paper_dir))
     paper_root = paper_dir.resolve()
@@ -260,7 +355,16 @@ def _materialize(source_dir: Path, paper_dir: Path, segments: list[Segment],
             path = temporary / relative
             text = path.read_text(encoding="utf-8")
             path.write_text(apply_translations(text, file_segments, translations), encoding="utf-8")
-        temporary.rename(target)
+        backup = None
+        if target.exists():
+            backup = paper_dir / f"translated-backup-{uuid.uuid4().hex[:8]}"
+            target.rename(backup)
+        try:
+            temporary.rename(target)
+        except OSError:
+            if backup is not None:
+                backup.rename(target)
+            raise
     finally:
         if temporary.exists():
             if temporary.resolve().parent != paper_root:
@@ -283,10 +387,23 @@ def run_translation(root: Path, paper_id: str, model: str, max_new_segments: int
                          "use --allow-unverified only after reviewing the source")
     paper_dir = root / "results" / "stage2" / paper_id
     state_path = paper_dir / "translations.json"
+    report_path = paper_dir / "report.json"
     state = (json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else
              {"schema_version": STATE_VERSION, "source_sha256": entry["source_sha256"],
               "extractor_version": EXTRACTOR_VERSION, "model": model,
+              "coverage_version": EXTRACTOR_VERSION,
               "segment_count": len(segments), "translations": {}})
+    previous_report = (json.loads(report_path.read_text(encoding="utf-8"))
+                       if report_path.is_file() else {})
+    extractor_version = state.get("extractor_version", 1)
+    migrated = False
+    if (state.get("segment_count") != len(segments) and extractor_version < 5 and
+            state.get("coverage_version", extractor_version) < 5):
+        legacy_count = len(_segments_for_version(source_dir, entry["main_tex"], extractor_version))
+        if state.get("segment_count") == legacy_count:
+            state["segment_count"] = len(segments)
+            state["coverage_version"] = 5
+            migrated = True
     if (state.get("schema_version") != STATE_VERSION or
             state.get("source_sha256") != entry["source_sha256"] or
             state.get("model") != model or state.get("segment_count") != len(segments)):
@@ -303,8 +420,13 @@ def run_translation(root: Path, paper_id: str, model: str, max_new_segments: int
                         "OPENAI_API_KEY" if translate_batch is openai_translate_batch else None)
         if required_key and not os.environ.get(required_key):
             raise ValueError(f"{required_key} is not set; no translation request was sent")
-    if not state_path.is_file():
+    if not state_path.is_file() or migrated:
         _write_json(state_path, state)
+    if migrated and previous_report.get("complete"):
+        _write_json(report_path, {**previous_report, "complete": False,
+                                  "segments_total": len(segments),
+                                  "segments_translated": len(translations),
+                                  "note": "Additional prose found; translation needs to resume."})
     for batch in _batches(selected):
         result = translate_batch(batch, model)
         if set(result) != {segment.id for segment in batch}:
@@ -318,16 +440,19 @@ def run_translation(root: Path, paper_id: str, model: str, max_new_segments: int
         translations.update(result)
         _write_json(state_path, state)
     complete = len(translations) == len(segments)
-    target = _materialize(source_dir, paper_dir, segments, translations) if complete else None
+    refresh = bool(previous_report and not previous_report.get("complete")) or migrated
+    target = (_materialize(source_dir, paper_dir, segments, translations, refresh=refresh)
+              if complete else None)
     report = {
         "paper_id": paper_id, "model": model, "source_sha256": entry["source_sha256"],
         "baseline_status": baseline_status, "segments_total": len(segments),
         "segments_translated": len(translations), "complete": complete,
+        "coverage_version": EXTRACTOR_VERSION,
         "translated_source": target.relative_to(root).as_posix() if target else None,
         "segments_by_file": dict(Counter(segment.path for segment in segments)),
         "note": "Conservative prose draft; commands, math, tables, bibliography and figures need human review before PDF compilation.",
     }
-    _write_json(paper_dir / "report.json", report)
+    _write_json(report_path, report)
     return report
 
 

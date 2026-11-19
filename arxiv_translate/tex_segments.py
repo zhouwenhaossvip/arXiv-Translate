@@ -36,6 +36,9 @@ TEXT_COMMANDS = {
     "textsc", "emph", "underline", "mbox", "textrm", "textsf", "texttt",
 }
 ENHANCED_TEXT_COMMANDS = TEXT_COMMANDS | {"abstract", "keywords", "uppercase"}
+CUSTOM_TEXT_COMMANDS = ENHANCED_TEXT_COMMANDS | {
+    "revision", "CR", "shortsection", "shortersection",
+}
 SPECIAL = set("\\$%{}&#_^~[]")
 MAX_SEGMENT_CHARS = 1200
 
@@ -198,9 +201,28 @@ def _split_run(text: str, start: int, end: int):
         pos = pos + blank.end() if blank else end
 
 
+def _uncovered_spans(start: int, end: int,
+                     excluded: tuple[tuple[int, int], ...]) -> list[tuple[int, int]]:
+    spans = [(start, end)]
+    for covered_start, covered_end in excluded:
+        remaining = []
+        for left, right in spans:
+            if covered_end <= left or covered_start >= right:
+                remaining.append((left, right))
+                continue
+            if left < covered_start:
+                remaining.append((left, covered_start))
+            if covered_end < right:
+                remaining.append((covered_end, right))
+        spans = remaining
+    return spans
+
+
 def extract_segments(text: str, relative_path: str, *, main_file: bool = False,
                      enhanced: bool = True, modern: bool = True,
-                     preamble_metadata: bool = True) -> list[Segment]:
+                     preamble_metadata: bool = True,
+                     custom_text_commands: bool = True,
+                     exclude_ranges: tuple[tuple[int, int], ...] = ()) -> list[Segment]:
     ranges: list[tuple[int, int]] = []
     if main_file:
         masked = _mask_comments(text)
@@ -234,10 +256,14 @@ def extract_segments(text: str, relative_path: str, *, main_file: bool = False,
     segments: list[Segment] = []
     for start, end in ranges:
         spans: list[tuple[int, int]] = []
-        commands = ENHANCED_TEXT_COMMANDS if enhanced else TEXT_COMMANDS
+        commands = (CUSTOM_TEXT_COMMANDS if custom_text_commands else
+                    ENHANCED_TEXT_COMMANDS) if enhanced else TEXT_COMMANDS
         for run_start, run_end in _plain_spans(text, start, end, commands,
                                                starred_text=modern):
-            spans.extend(_split_run(text, run_start, run_end))
+            for a, b in _split_run(text, run_start, run_end):
+                spans.extend((left, right) for left, right in
+                             _uncovered_spans(a, b, exclude_ranges)
+                             if sum(ch.isalpha() and ch.isascii() for ch in text[left:right]) >= 3)
         groups: list[list[tuple[int, int]]] = []
         for a, b in spans:
             gap = text[groups[-1][-1][1]:a] if groups else ""
@@ -261,8 +287,8 @@ def extract_segments(text: str, relative_path: str, *, main_file: bool = False,
     return segments
 
 
-def reachable_tex(source_dir: Path, main_tex: str) -> list[str]:
-    """Follow literal input/include commands; exclude code-like figure/table files."""
+def reachable_tex(source_dir: Path, main_tex: str, *, root_relative_inputs: bool = True) -> list[str]:
+    """Follow literal input/include commands using TeX's root-first search order."""
     root = source_dir.resolve()
     pending = [Path(main_tex)]
     found: set[str] = set()
@@ -287,7 +313,10 @@ def reachable_tex(source_dir: Path, main_tex: str) -> list[str]:
             child = Path(match.group(1))
             if not child.suffix:
                 child = child.with_suffix(".tex")
-            pending.append(relative.parent / child)
+            if root_relative_inputs and (root / child).is_file():
+                pending.append(child)
+            else:
+                pending.append(relative.parent / child)
     return sorted(found)
 
 

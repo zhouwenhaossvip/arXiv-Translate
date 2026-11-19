@@ -55,6 +55,7 @@ function renderTask(task) {
   $("progressCard").hidden = false;
   $("paperLabel").textContent = `${task.paper_id} · ${task.model}`;
   $("taskMessage").textContent = task.message || "";
+  $("taskMessage").className = task.status === "failed" ? "error-message" : "task-message";
   $("statePill").textContent = task.status === "done" ? "已完成" : task.status === "failed" ? "未完成" : "进行中";
   $("statePill").className = `state-pill ${task.status === "done" ? "done" : task.status === "failed" ? "failed" : ""}`;
   let index = steps.indexOf(task.step);
@@ -114,7 +115,6 @@ form.addEventListener("submit", async (event) => {
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "无法创建任务。");
-    $("apiKey").value = "";
     renderTask(result);
     if (result.status === "working") pollTimer = setTimeout(() => poll(result.id), 1000);
   } catch (error) {

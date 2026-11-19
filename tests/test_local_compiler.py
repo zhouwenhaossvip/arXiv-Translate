@@ -98,6 +98,55 @@ class LocalCompilerTests(unittest.TestCase):
         self.assertIn("normalized_tikz_node_label", result["compatibility_actions"])
         self.assertEqual(figure.read_text(encoding="utf-8"), original_label)
 
+    def test_legacy_minted_frozen_cache_uses_minted2_only_in_compile_copy(self):
+        (self.source / "main.tex").write_text(
+            "\\documentclass{article}\n\\input{preamble}\n\\begin{document}Hello\\end{document}\n",
+            encoding="utf-8",
+        )
+        preamble = self.source / "preamble.tex"
+        original = b"\\usepackage[frozencache,cachedir=.]{minted}\n"
+        preamble.write_bytes(original)
+        style = self.source / "default.pygstyle"
+        code = self.source / "listing1.pygtex"
+        style.write_bytes(b"% legacy style\n")
+        code.write_bytes(b"% legacy code\n")
+
+        def run(command, **kwargs):
+            copied = Path(kwargs["cwd"]) / "preamble.tex"
+            self.assertEqual(copied.read_bytes(), original.replace(b"{minted}", b"{minted2}"))
+            self.assertIn("-no-shell-escape", command)
+            (Path(kwargs["cwd"]) / "main.pdf").write_bytes(b"%PDF-1.7\ncompiled")
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch("arxiv_translate.local_compiler.subprocess.run", side_effect=run):
+            result = compile_local(self.source, [self.source / "main.tex", preamble, style, code],
+                                   "main.tex", "pdflatex", "latexmk", 3,
+                                   self.output / "compiled" / "2511.02841v2.pdf",
+                                   self.output / "logs" / "2511.02841v2.txt")
+        self.assertEqual(result["status"], "compiled")
+        self.assertIn("used_minted2_for_legacy_frozen_cache:1", result["compatibility_actions"])
+        self.assertEqual(preamble.read_bytes(), original)
+
+    def test_modern_minted_cache_is_not_rewritten(self):
+        preamble = self.source / "preamble.tex"
+        original = b"\\usepackage[frozencache,cachedir=.]{minted}\n"
+        preamble.write_bytes(original)
+        (self.source / "default.pygstyle").write_bytes(b"legacy")
+        (self.source / "listing1.pygtex").write_bytes(b"legacy")
+        (self.source / "default.style.minted").write_bytes(b"modern")
+
+        def run(command, **kwargs):
+            self.assertEqual((Path(kwargs["cwd"]) / "preamble.tex").read_bytes(), original)
+            (Path(kwargs["cwd"]) / "main.pdf").write_bytes(b"%PDF-1.7\ncompiled")
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch("arxiv_translate.local_compiler.subprocess.run", side_effect=run):
+            result = compile_local(self.source, list(self.source.rglob("*")), "main.tex",
+                                   "pdflatex", "latexmk", 3,
+                                   self.output / "compiled" / "2511.02841v2.pdf",
+                                   self.output / "logs" / "2511.02841v2.txt")
+        self.assertEqual(result["compatibility_actions"], [])
+
     def test_direct_bbl_input_disables_bibtex(self):
         (self.source / "main.tex").write_text(
             "\\documentclass{article}\n\\begin{document}Test\\input{main.bbl}\\end{document}\n", encoding="utf-8"

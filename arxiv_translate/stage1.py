@@ -33,7 +33,7 @@ DEFAULT_ENDPOINT = "https://latexonline.cc/data"
 CLIENT_TIMEZONE = timezone(timedelta(hours=8))
 MAX_SOURCE_BYTES = 50 * 1024 * 1024
 MAX_RESPONSE_BYTES = 50 * 1024 * 1024
-LOCAL_BASELINE_VERSION = 2
+LOCAL_BASELINE_VERSION = 3
 
 
 def sha256_file(path: Path) -> str:

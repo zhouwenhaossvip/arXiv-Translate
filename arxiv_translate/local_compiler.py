@@ -18,6 +18,11 @@ MAX_LOG_BYTES = 10 * 1024 * 1024
 ENGINE_OPTIONS = {"pdflatex": "-pdf", "xelatex": "-xelatex", "lualatex": "-lualatex"}
 CAS_CLASS = re.compile(r"\\documentclass\s*(?:\[[^]]*\])?\s*\{cas-(?:dc|sc)\}", re.I)
 DIRECT_BBL = re.compile(r"\\(?:input|include)\s*\{([^}]+\.bbl)\}", re.I)
+LEGACY_MINTED_USE = re.compile(
+    rb"(?m)^(?P<head>[ \t]*\\(?:usepackage|RequirePackage)\s*\["
+    rb"(?P<options>[^\]\r\n]*)\]\s*\{\s*)minted(?P<tail>\s*\})"
+)
+FROZEN_CACHE_OPTION = re.compile(rb"(?:^|,)\s*frozencache(?:\s*=\s*true)?\s*(?:,|$)", re.I)
 UNRESOLVED_CITATIONS = re.compile(r"Latex failed to resolve\s+\d+\s+citation\(s\)", re.I)
 MISSING_BIB_ENTRY = re.compile(r'Warning--I didn\'t find a database entry for "([^"]+)"')
 CAS_EMAIL_ASSET = Path(__file__).with_name("assets") / "cas-email.jpeg.b64"
@@ -104,6 +109,28 @@ def prepare_compatibility(work: Path, main_tex: str) -> tuple[list[str], Path | 
                                                        r"{co-located: Kernel$_A$ = Kernel$_B$}"),
                                    encoding="utf-8")
             actions.append("normalized_tikz_node_label")
+
+    # arXiv may bundle minted 2's frozen .pygstyle/.pygtex cache, while a
+    # current TeX installation selects minted 3's incompatible cache format.
+    # Only adapt the disposable copy; shell escape remains disabled.
+    if (any(work.rglob("*.pygstyle")) and any(work.rglob("*.pygtex"))
+            and not any(work.rglob("*.style.minted"))):
+        changed = 0
+        for path in work.rglob("*.tex"):
+            original = path.read_bytes()
+
+            def use_minted2(match: re.Match[bytes]) -> bytes:
+                nonlocal changed
+                if not FROZEN_CACHE_OPTION.search(match.group("options")):
+                    return match.group(0)
+                changed += 1
+                return match.group("head") + b"minted2" + match.group("tail")
+
+            updated = LEGACY_MINTED_USE.sub(use_minted2, original)
+            if updated != original:
+                path.write_bytes(updated)
+        if changed:
+            actions.append(f"used_minted2_for_legacy_frozen_cache:{changed}")
 
     # arXiv often supplies the generated .bbl instead of the .bib database.
     # \bibliography{...} still reads this file, so a direct \input is not required.

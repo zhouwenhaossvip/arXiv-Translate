@@ -7,10 +7,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from arxiv_translate.stage2 import (deepseek_translate_batch, main, openai_translate_batch,
-                                    paper_plan, run_translation)
+from arxiv_translate.stage2 import (_segments_for_version, deepseek_translate_batch, main,
+                                    openai_translate_batch, paper_plan, run_translation)
 from arxiv_translate.tex_segments import (apply_translations, extract_segments,
-                                           reachable_tex, render_translation)
+                                           reachable_tex, render_translation, Segment)
 
 
 class StageTwoTests(unittest.TestCase):
@@ -97,7 +97,76 @@ class StageTwoTests(unittest.TestCase):
         expected = extract_segments(text, "main.tex", main_file=True, enhanced=False, modern=False)
         _, _, resumed = paper_plan(self.root, "2608.17220v1")
         main_resumed = [item for item in resumed if item.path == "main.tex"]
-        self.assertEqual([item.id for item in main_resumed], [item.id for item in expected])
+        self.assertEqual([item.id for item in main_resumed[:len(expected)]],
+                         [item.id for item in expected])
+        self.assertTrue(any("English abstract here" in item.text
+                            for item in main_resumed[len(expected):]))
+
+    def test_nested_root_relative_inputs_and_custom_text_are_translated(self):
+        body = self.source / "sections" / "body.tex"
+        body.write_text(body.read_text(encoding="utf-8") +
+                        "\\input{sections/protocol}\n"
+                        "\\revision{Revised prose belongs in Chinese.}\n"
+                        "\\CR{A highlighted English claim.}\n"
+                        "\\shortsection{Security goals}\n"
+                        "\\shortersection{Signature schemes}\n", encoding="utf-8")
+        (self.source / "sections" / "protocol.tex").write_text(
+            "Protocol steps contain ordinary English prose.\n", encoding="utf-8")
+        self.assertIn("sections/protocol.tex", reachable_tex(self.source, "main.tex"))
+        self.assertNotIn("sections/protocol.tex",
+                         reachable_tex(self.source, "main.tex", root_relative_inputs=False))
+        _, _, segments = paper_plan(self.root, "2608.17220v1")
+        combined = " ".join(segment.text for segment in segments)
+        for phrase in ("Protocol steps", "Revised prose", "highlighted English claim",
+                       "Security goals", "Signature schemes"):
+            self.assertIn(phrase, combined)
+        self.assertNotIn("hidden math words", combined)
+
+    def test_completed_v4_checkpoint_adds_only_missing_text_and_rebuilds_draft(self):
+        body = self.source / "sections" / "body.tex"
+        body.write_text(body.read_text(encoding="utf-8") +
+                        "\\input{sections/protocol}\n"
+                        "\\revision{Newly discovered paragraph.}\n", encoding="utf-8")
+        (self.source / "sections" / "protocol.tex").write_text(
+            "Nested protocol prose.\n", encoding="utf-8")
+        entry, source_dir, _ = paper_plan(self.root, "2608.17220v1")
+        legacy = _segments_for_version(source_dir, entry["main_tex"], 4)
+        paper_dir = self.root / "results/stage2/2608.17220v1"
+        paper_dir.mkdir(parents=True)
+        old_translations = {
+            segment.id: "旧译文" + "".join(
+                f"[[LATEX_{index}]]" for index in range(len(segment.protected)))
+            for segment in legacy
+        }
+        (paper_dir / "translations.json").write_text(json.dumps({
+            "schema_version": 1, "source_sha256": entry["source_sha256"],
+            "extractor_version": 4, "model": "test-model",
+            "segment_count": len(legacy), "translations": old_translations,
+        }), encoding="utf-8")
+        (paper_dir / "report.json").write_text(json.dumps({
+            "complete": True, "segments_total": len(legacy),
+        }), encoding="utf-8")
+        previous = paper_dir / "translated"
+        previous.mkdir()
+        (previous / "old-marker.txt").write_text("old draft", encoding="utf-8")
+
+        def translate(batch, model):
+            self.assertTrue(all(segment.id not in old_translations for segment in batch))
+            return {segment.id: "新译文" + "".join(
+                f"[[LATEX_{index}]]" for index in range(len(segment.protected)))
+                for segment in batch}
+
+        report = run_translation(self.root, "2608.17220v1", "test-model", None,
+                                 translate_batch=translate)
+        self.assertTrue(report["complete"])
+        self.assertGreater(report["segments_total"], len(legacy))
+        state = json.loads((paper_dir / "translations.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["coverage_version"], 5)
+        self.assertEqual({key: state["translations"][key] for key in old_translations},
+                         old_translations)
+        self.assertIn("新译文", (previous / "sections/protocol.tex").read_text(encoding="utf-8"))
+        self.assertIn("旧译文", (previous / "main.tex").read_text(encoding="utf-8"))
+        self.assertEqual(len(list(paper_dir.glob("translated-backup-*/old-marker.txt"))), 1)
 
     def test_modern_extractor_translates_starred_headings_but_not_raw_references(self):
         text = ("\\documentclass{article}\\begin{document}\n"
@@ -230,6 +299,19 @@ class StageTwoTests(unittest.TestCase):
             self.assertEqual(deepseek_translate_batch([segment], "deepseek-flash"),
                              {segment.id: "引言"})
 
+    def test_new_model_options_use_existing_compatible_adapters(self):
+        segment = paper_plan(self.root, "2608.17220v1")[2][0]
+        with patch("arxiv_translate.stage2._responses_translate_batch", return_value={segment.id: "引言"}) as request:
+            self.assertEqual(deepseek_translate_batch([segment], "deepseek-v4-pro"),
+                             {segment.id: "引言"})
+            self.assertEqual(request.call_args.args[1], "deepseek-v4-pro")
+            self.assertTrue(request.call_args.kwargs["disable_reasoning"])
+            self.assertEqual(request.call_args.kwargs["api_key_env"], "DEEPSEEK_API_KEY")
+            for model in ("gpt-4.1-mini", "gpt-4.1", "gpt-4o"):
+                self.assertEqual(openai_translate_batch([segment], model), {segment.id: "引言"})
+                self.assertEqual(request.call_args.args[1], model)
+                self.assertEqual(request.call_args.kwargs["api_key_env"], "OPENAI_API_KEY")
+
     def test_deepseek_run_requires_key_before_writing(self):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(ValueError, "DEEPSEEK_API_KEY is not set"):
@@ -261,6 +343,120 @@ class StageTwoTests(unittest.TestCase):
         with patch("arxiv_translate.stage2._responses_translate_batch", side_effect=request):
             result = deepseek_translate_batch(segments, "deepseek-flash")
         self.assertEqual(set(result), {segment.id for segment in segments})
+
+    def test_deepseek_reuses_valid_rows_and_requests_only_missing_ids(self):
+        segments = [Segment(f"s{index}", "main.tex", index * 10, index * 10 + 5,
+                            f"English sentence {index}") for index in range(3)]
+        requested = []
+
+        def urlopen(request, timeout):
+            payload = json.loads(request.data.decode("utf-8"))
+            ids = [row["id"] for row in
+                   json.loads(payload["input"][1]["content"])["translations_required"]]
+            requested.append(ids)
+            returned = [segments[0].id, segments[2].id] if len(requested) == 1 else ids
+            rows = [{"id": row_id, "text": f"译文 {row_id}"} for row_id in returned]
+            if len(requested) == 1:
+                rows.append({"id": "unrequested", "text": "不使用"})
+            body = {"status": "completed", "output": [{"type": "message", "content": [
+                {"type": "output_text", "text": json.dumps({"translations": rows}, ensure_ascii=False)}]}]}
+            return io.BytesIO(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-only-key"}), \
+             patch("arxiv_translate.stage2.urllib.request.urlopen", side_effect=urlopen):
+            result = deepseek_translate_batch(segments, "deepseek-flash")
+        self.assertEqual(set(result), {segment.id for segment in segments})
+        self.assertEqual(requested, [["s0", "s1", "s2"], ["s1"]])
+
+    def test_deepseek_does_not_reuse_duplicate_or_invalid_rows(self):
+        segments = [Segment(f"s{index}", "main.tex", index * 10, index * 10 + 5,
+                            f"English sentence {index}") for index in range(3)]
+        requested = []
+
+        def urlopen(request, timeout):
+            payload = json.loads(request.data.decode("utf-8"))
+            ids = [row["id"] for row in
+                   json.loads(payload["input"][1]["content"])["translations_required"]]
+            requested.append(ids)
+            rows = ([{"id": "s0", "text": "重复一"}, {"id": "s0", "text": "重复二"},
+                     {"id": "s1", "text": ""}, {"id": "s2", "text": "可用"}]
+                    if len(requested) == 1 else
+                    [{"id": row_id, "text": f"译文 {row_id}"} for row_id in ids])
+            body = {"status": "completed", "output": [{"type": "message", "content": [
+                {"type": "output_text", "text": json.dumps({"translations": rows}, ensure_ascii=False)}]}]}
+            return io.BytesIO(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-only-key"}), \
+             patch("arxiv_translate.stage2.urllib.request.urlopen", side_effect=urlopen):
+            result = deepseek_translate_batch(segments, "deepseek-flash")
+        self.assertEqual(result["s2"], "可用")
+        self.assertEqual(requested, [["s0", "s1", "s2"], ["s0", "s1"]])
+
+    def test_single_response_with_wrong_id_is_unambiguous(self):
+        segment = paper_plan(self.root, "2608.17220v1")[2][0]
+        response = {"status": "completed", "output": [{"type": "message", "content": [
+            {"type": "output_text", "text": json.dumps({"translations": [
+                {"id": "model-rewrote-the-id", "text": "中文标题"}]}, ensure_ascii=False)}]}]}
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-only-key"}), \
+             patch("arxiv_translate.stage2.urllib.request.urlopen",
+                   return_value=io.BytesIO(json.dumps(response, ensure_ascii=False).encode("utf-8"))):
+            self.assertEqual(deepseek_translate_batch([segment], "deepseek-flash"),
+                             {segment.id: "中文标题"})
+
+    def test_single_response_without_id_uses_id_free_fallback(self):
+        segment = paper_plan(self.root, "2608.17220v1")[2][0]
+        formats = []
+
+        def urlopen(request, timeout):
+            payload = json.loads(request.data.decode("utf-8"))
+            schema = payload["text"]["format"]["schema"]
+            formats.append(set(schema["properties"]))
+            value = {"translations": []} if "translations" in schema["properties"] else {"text": "中文标题"}
+            response = {"status": "completed", "output": [{"type": "message", "content": [
+                {"type": "output_text", "text": json.dumps(value, ensure_ascii=False)}]}]}
+            return io.BytesIO(json.dumps(response, ensure_ascii=False).encode("utf-8"))
+
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-only-key"}), \
+             patch("arxiv_translate.stage2.urllib.request.urlopen", side_effect=urlopen):
+            self.assertEqual(deepseek_translate_batch([segment], "deepseek-flash"),
+                             {segment.id: "中文标题"})
+        self.assertEqual(formats, [{"translations"}, {"text"}])
+
+    def test_single_empty_response_uses_id_free_fallback(self):
+        segment = next(s for s in paper_plan(self.root, "2608.17220v1")[2]
+                       if not s.protected)
+        formats = []
+
+        def urlopen(request, timeout):
+            payload = json.loads(request.data.decode("utf-8"))
+            properties = set(payload["text"]["format"]["schema"]["properties"])
+            formats.append(properties)
+            value = ({"translations": [{"id": segment.id, "text": ""}]}
+                     if "translations" in properties else {"text": "中文标题"})
+            response = {"status": "completed", "output": [{"type": "message", "content": [
+                {"type": "output_text", "text": json.dumps(value, ensure_ascii=False)}]}]}
+            return io.BytesIO(json.dumps(response, ensure_ascii=False).encode("utf-8"))
+
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "test-only-key"}), \
+             patch("arxiv_translate.stage2.urllib.request.urlopen", side_effect=urlopen):
+            self.assertEqual(deepseek_translate_batch([segment], "deepseek-flash"),
+                             {segment.id: "中文标题"})
+        self.assertEqual(formats, [{"translations"}, {"text"}])
+
+    def test_missing_id_then_bad_placeholders_recovers_piecewise(self):
+        segment = next(s for s in paper_plan(self.root, "2608.17220v1")[2]
+                       if s.protected)
+
+        def request(items, model, **kwargs):
+            if kwargs.get("single_text"):
+                raise ValueError("Protected LaTeX placeholders were changed")
+            if items[0].protected:
+                raise RuntimeError("Translation response omitted, duplicated, or added segment IDs")
+            return {item.id: "译文" for item in items}
+
+        with patch("arxiv_translate.stage2._responses_translate_batch", side_effect=request):
+            result = deepseek_translate_batch([segment], "deepseek-flash")
+        self.assertEqual(result[segment.id].count("[[LATEX_"), len(segment.protected))
 
     def test_deepseek_recovers_malformed_structured_output(self):
         segments = paper_plan(self.root, "2608.17220v1")[2][:2]

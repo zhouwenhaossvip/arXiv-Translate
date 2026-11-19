@@ -8,6 +8,10 @@ __pycache__/
 .mypy_cache/
 .coverage
 htmlcov/
+/build/
+/dist/
+/packaging/generated/
+/*.spec
 .DS_Store
 Thumbs.db
 

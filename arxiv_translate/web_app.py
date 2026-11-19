@@ -30,20 +30,39 @@ from .qa import audit_paper
 from .stage1 import (ARXIV_ID, MAX_SOURCE_BYTES, choose_main, inventory,
                      run_local_baseline, sha256_file, source_files)
 from .stage2 import paper_plan, run_translation
-from .stage3 import compile_paper
+from .stage3 import compile_paper, preflight_chinese_compiler
 
 
-MODELS = {"deepseek-flash": "DEEPSEEK_API_KEY", "gpt-4o-mini": "OPENAI_API_KEY"}
+MODELS = {
+    "deepseek-flash": "DEEPSEEK_API_KEY",
+    "deepseek-v4-pro": "DEEPSEEK_API_KEY",
+    "gpt-4o-mini": "OPENAI_API_KEY",
+    "gpt-4.1-mini": "OPENAI_API_KEY",
+    "gpt-4.1": "OPENAI_API_KEY",
+    "gpt-4o": "OPENAI_API_KEY",
+}
 MAX_PDF_BYTES = 25 * 1024 * 1024
 MAX_REQUEST_BYTES = 36 * 1024 * 1024
 ID_IN_TEXT = re.compile(r"(?:arxiv\s*:\s*|arxiv\.org/(?:abs|pdf)/)(\d{4}\.\d{4,5}v\d+)", re.I)
 ID_IN_NAME = re.compile(r"(?<![\d.])(\d{4}\.\d{4,5}v\d+)(?!\d)", re.I)
+UNVERSIONED_ID_IN_TEXT = re.compile(r"(?:arxiv\s*:\s*|arxiv\.org/(?:abs|pdf)/)\d{4}\.\d{4,5}(?!\d|v\d)", re.I)
+UNVERSIONED_ID_IN_NAME = re.compile(r"(?<![\d.])\d{4}\.\d{4,5}(?![\d.]|v\d)", re.I)
+
+
+class NoLatexSource(ValueError):
+    """arXiv returned something other than usable LaTeX source."""
+
+
+def missing_source_message(paper_id: str) -> str:
+    return (f"识别到 arXiv 格式编号 {paper_id}，但未获取到该版本可用的 LaTeX 源码。"
+            "请确认论文确实收录于 arXiv，并核对编号和版本；如果 arXiv 仅提供 PDF，当前无法保留排版进行翻译。")
 
 
 def detect_arxiv_id(pdf: bytes, filename: str) -> str:
     """Require an explicit version so the source matches the uploaded PDF."""
     from_name = ID_IN_NAME.search(filename)
     from_pdf = None
+    pdf_text = ""
     with tempfile.TemporaryDirectory(prefix="arxiv-id-") as temp:
         path = Path(temp) / "paper.pdf"
         path.write_bytes(pdf)
@@ -53,14 +72,17 @@ def detect_arxiv_id(pdf: bytes, filename: str) -> str:
                 capture_output=True, timeout=20, check=False,
             )
             if result.returncode == 0:
-                from_pdf = ID_IN_TEXT.search(result.stdout.decode("utf-8", errors="replace"))
+                pdf_text = result.stdout.decode("utf-8", errors="replace")
+                from_pdf = ID_IN_TEXT.search(pdf_text)
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
     if from_pdf and from_name and from_pdf.group(1).lower() != from_name.group(1).lower():
         raise ValueError("PDF 内的 arXiv 版本号与文件名不一致，请核对论文后重试。")
     paper_id = (from_pdf or from_name).group(1) if (from_pdf or from_name) else None
     if not paper_id or not ARXIV_ID.fullmatch(paper_id):
-        raise ValueError("无法识别带版本的 arXiv 编号。请将 PDF 命名为 2511.02841v2.pdf 后上传。")
+        if UNVERSIONED_ID_IN_TEXT.search(pdf_text) or UNVERSIONED_ID_IN_NAME.search(filename):
+            raise ValueError("检测到 arXiv 编号，但缺少版本号。请核对论文版本，并将 PDF 命名为 2511.02841v2.pdf 这样的格式后重试。")
+        raise ValueError("未识别到 arXiv 论文编号。当前仅支持 arXiv 论文；如果这篇论文来自 arXiv，请核对来源并将 PDF 命名为 2511.02841v2.pdf 后重试。")
     return paper_id.lower()
 
 
@@ -75,7 +97,7 @@ def _safe_source_name(name: str) -> PurePosixPath:
 
 def _extract_source(data: bytes, target: Path) -> None:
     if data.startswith(b"%PDF-") or data.lstrip().startswith(b"<"):
-        raise ValueError("arXiv 没有提供可用的 LaTeX 源码（返回了 PDF 或网页）")
+        raise NoLatexSource("arXiv 返回了 PDF 或网页，而不是 LaTeX 源码")
     target.mkdir(parents=True, exist_ok=False)
     if tarfile.is_tarfile(io.BytesIO(data)):
         total = 0
@@ -126,6 +148,8 @@ def download_source(root: Path, paper_id: str) -> None:
         with urllib.request.urlopen(request, timeout=60) as response:
             data = response.read(MAX_SOURCE_BYTES + 1)
     except urllib.error.HTTPError as error:
+        if error.code in {404, 410}:
+            raise NoLatexSource(missing_source_message(paper_id)) from error
         raise ValueError(f"arXiv 源码下载失败（HTTP {error.code}）") from error
     except urllib.error.URLError as error:
         raise ValueError("无法连接 arXiv 下载 LaTeX 源码") from error
@@ -134,7 +158,10 @@ def download_source(root: Path, paper_id: str) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     staging = target.parent / f".{paper_id}-{uuid.uuid4().hex}.tmp"
     try:
-        _extract_source(data, staging)
+        try:
+            _extract_source(data, staging)
+        except NoLatexSource as error:
+            raise NoLatexSource(missing_source_message(paper_id)) from error
         staging.rename(target)
     finally:
         if staging.exists():
@@ -158,9 +185,9 @@ def save_pdf(root: Path, paper_id: str, data: bytes) -> None:
 
 
 class TaskApp:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, web: Path | None = None):
         self.root = root.resolve()
-        self.web = self.root / "web"
+        self.web = (web if web is not None else self.root / "web").resolve()
         self.tasks: dict[str, dict] = {}
         self.lock = threading.Lock()
         self.busy = False
@@ -192,7 +219,7 @@ class TaskApp:
                 return None
             result = item.copy()
         result.pop("pdf_path", None)
-        if result["step"] == "translating":
+        if result["step"] in {"translating", "failed"} and result.get("segments_total") is not None:
             checkpoint = self.root / "results" / "stage2" / result["paper_id"] / "translations.json"
             if checkpoint.is_file():
                 try:
@@ -218,7 +245,7 @@ class TaskApp:
             manifest = inventory(self.root)
             entry = next((p for p in manifest["papers"] if p["id"] == paper_id), None)
             if not entry or entry["status"] != "ready":
-                raise ValueError("LaTeX 源码未就绪；请检查是否有唯一的主 TeX 文件。")
+                raise ValueError(f"已找到 arXiv 论文 {paper_id}，但对应版本的 LaTeX 源码不可用或无法确定主 TeX 文件。请核对 arXiv 版本和源码文件。")
             self._update(token, step="baseline", message="正在验证原论文可以编译…")
             baseline = run_local_baseline(
                 self.root, manifest, self.root / "results" / "stage1" / "local",
@@ -226,10 +253,17 @@ class TaskApp:
             )
             original = baseline["papers"].get(paper_id, {})
             if original.get("status") != "compiled":
-                raise ValueError(f"原论文编译未通过（{original.get('status', 'unknown')}）；请查看阶段一日志。")
+                reason = original.get("first_error") or original.get("error") or "请查看阶段一日志"
+                raise ValueError(f"原论文编译未通过（{original.get('status', 'unknown')}）：{reason}")
             if original.get("page_count_match") is False:
                 raise ValueError("源码重编页数与上传 PDF 不一致；为避免翻译错误版本，已停止任务。")
             _, _, segments = paper_plan(self.root, paper_id)
+            checkpoint = self.root / "results" / "stage2" / paper_id / "translations.json"
+            saved = (json.loads(checkpoint.read_text(encoding="utf-8")).get("translations", {})
+                     if checkpoint.is_file() else {})
+            if any(segment.id not in saved for segment in segments):
+                self._update(token, step="baseline", message="正在检查中文编译环境…")
+                preflight_chinese_compiler(self.root)
             self._update(token, step="translating", message="正在翻译正文…", segments_total=len(segments))
             old_key = os.environ.get(key_name)
             os.environ[key_name] = key
@@ -246,18 +280,36 @@ class TaskApp:
                          segments_done=report["segments_translated"])
             result = compile_paper(self.root, paper_id)
             if result.get("status") != "compiled":
-                raise ValueError(f"中文 PDF 编译失败：{result.get('first_error') or result.get('status')}")
+                log = result.get("log")
+                detail = str(result.get("first_error") or result.get("status"))[:250]
+                location = f"；编译日志：{self.root / log}" if log else ""
+                raise ValueError(f"中文 PDF 编译失败：{detail}{location}")
             pdf_path = (self.root / result["pdf"]).resolve()
             if self.root not in pdf_path.parents or not pdf_path.is_file():
                 raise ValueError("编译结果文件不存在")
+            qa_status = "unavailable"
+            qa_issue_count = None
             try:
-                audit_paper(self.root, paper_id, render_pages=False)
+                quality = audit_paper(self.root, paper_id, render_pages=False)
+                qa_status = quality["status"]
+                qa_issue_count = len(quality.get("issues", []))
             except Exception:
-                pass  # PDF is still available for manual review.
-            self._update(token, status="done", step="done", message="翻译完成，请检查译文与排版。",
+                pass  # The compiled PDF remains available if QA itself fails.
+            if qa_status == "pass":
+                message = "翻译完成，请检查译文与排版。"
+            elif qa_status == "needs_review":
+                message = f"中文 PDF 已生成，但质量检查发现 {qa_issue_count} 类问题需人工复核。"
+            elif qa_status == "blocked":
+                message = "中文 PDF 已生成，但质量检查发现阻断性问题；请先查看验收报告，不要直接使用。"
+            else:
+                message = "中文 PDF 已生成，但自动质量检查未完成；请人工检查译文与排版。"
+            self._update(token, status="done", step="done", message=message,
+                         qa_status=qa_status, qa_issue_count=qa_issue_count,
                          pdf_ready=True, pdf_path=str(pdf_path), pages=result.get("pages"))
         except Exception as error:
             message = str(error).replace(key, "[已隐藏]")[:500] or "任务失败，请检查日志。"
+            if "Translation response omitted, duplicated, or added segment IDs" in message:
+                message = "模型返回的片段编号不完整；已保留完成的译文，请点击重新尝试。"
             self._update(token, status="failed", step="failed", message=message)
         finally:
             with self.lock:

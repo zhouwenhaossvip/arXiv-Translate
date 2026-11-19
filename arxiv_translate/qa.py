@@ -14,6 +14,7 @@ from typing import Any
 
 from .local_compiler import pdf_page_count
 from .stage1 import active_tex, fingerprint, inventory, sha256_file, source_files
+from .stage3 import classify_missing_characters
 from .tex_segments import _balanced_end, extract_segments, reachable_tex
 
 
@@ -205,7 +206,7 @@ def audit_paper(root: Path, paper_id: str, *, render_pages: bool = True) -> dict
         flag("阻断", "reference_change", "引用或标签命令与原文不一致。")
     if math_diff_count:
         flag("阻断", "math_change", "数学环境或公式分隔符与原文不一致。")
-    missing_glyphs = log.count("Missing character:")
+    missing_glyphs = classify_missing_characters(log)["missing_glyph_warnings"]
     if missing_glyphs:
         flag("阻断", "missing_glyph", f"编译日志包含 {missing_glyphs} 条缺字警告。")
     if english_fields or untranslated_spans:

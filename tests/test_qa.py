@@ -84,6 +84,21 @@ class QualityAuditTests(unittest.TestCase):
         self.assertEqual({item["code"] for item in changed["issues"]},
                          {"stale_pdf", "reference_change"})
 
+    def test_audit_ignores_academicons_setup_space_warning(self):
+        self._translate()
+        stage3 = self.root / "results" / "stage3" / self.paper_id
+        log = stage3 / "compile.log"
+        log.write_text("Missing character: There is no   in font [academicons.otf]/OT!\n",
+                       encoding="utf-8")
+        report_path = stage3 / "report.json"
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        report["log"] = f"results/stage3/{self.paper_id}/compile.log"
+        report_path.write_text(json.dumps(report), encoding="utf-8")
+        with patch("arxiv_translate.qa.pdf_page_count", return_value=1):
+            audited = audit_paper(self.root, self.paper_id, render_pages=False)
+        self.assertEqual(audited["missing_glyph_warnings"], 0)
+        self.assertNotIn("missing_glyph", {issue["code"] for issue in audited["issues"]})
+
 
 if __name__ == "__main__":
     unittest.main()

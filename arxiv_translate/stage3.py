@@ -9,19 +9,24 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import unicodedata
 from pathlib import Path
 from typing import Any
 
 from .local_compiler import compile_local, pdf_page_count, probe_latexmk
 from .stage1 import fingerprint, inventory, source_files
+from .stage2 import paper_plan
 
 
-STAGE_VERSION = 22
+STAGE_VERSION = 27
 WINDOWS_FONTS = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+USER_WINDOWS_FONTS = (Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))) /
+                      "Microsoft" / "Windows" / "Fonts")
 SYMBOL_FONT = "Segoe UI Symbol" if sys.platform == "win32" else "DejaVu Sans"
 DEFAULT_FONT = ("Noto Serif SC" if (sys.platform == "win32" and
-                                    (WINDOWS_FONTS / "NotoSerifSC-VF.ttf").is_file())
+                                    any((folder / "NotoSerifSC-VF.ttf").is_file()
+                                        for folder in (WINDOWS_FONTS, USER_WINDOWS_FONTS)))
                 else "SimSun" if sys.platform == "win32" else "FandolSong-Regular")
 CJK_PACKAGE = re.compile(r"\\usepackage(?:\[[^]]*\])?\s*\{[^}]*(?:xeCJK|ctex|luatexja)[^}]*\}", re.I)
 BEGIN_DOCUMENT = re.compile(r"\\begin\s*\{document\}")
@@ -29,6 +34,17 @@ PDFOUTPUT_LINE = re.compile(r"(?m)^\s*\\pdfoutput\s*=\s*1\s*$")
 FONT_NAME = re.compile(r"^[\w ._-]+$", re.UNICODE)
 LATIN_EXTENDED = re.compile(r"[\u00c0-\u024f\u1e00-\u1eff]")
 CONTROL_CJK = re.compile(r"(\\[A-Za-z@]+)(?=[\u3400-\u9fff])")
+UNBRACED_MATH_ALPHABET_SUBSCRIPT = re.compile(
+    r"(?<!\\)_(\\(?:mathcal|mathbb)\{[A-Za-z]+\})"
+)
+MATH_ALPHABET_MACRO = re.compile(
+    r"\\(?:newcommand|renewcommand|providecommand|DeclareRobustCommand)\*?\s*"
+    r"\{\\([A-Za-z@]+)\}\s*\{\\(?:mathcal|mathbb)\{[A-Za-z]+\}\}"
+)
+ACADEMICON_SPACE_WARNING = re.compile(
+    r"^\s*Missing character: There is no {3}in font \[academicons\.otf\]/OT"
+    r"(?::language=dflt;)?!$"
+)
 LEGACY_FONT_LINE = re.compile(
     r"(?m)^[ \t]*\\(?:usepackage|RequirePackage)(?:\[[^]\n]*\])?"
     r"\{(?:fontenc|newtxtext,newtxmath|newtxtext|newtxmath|mathptmx)\}[ \t]*$"
@@ -38,6 +54,12 @@ SPECIAL_FONT_LINE = re.compile(
     r"\{(?:fontenc|newtxtext,newtxmath|newtxtext|newtxmath|mathptmx|"
     r"cmap|tgpagella|inconsolata|XCharter|zlmtt|mathpazo|fdsymbol)\}[ \t]*$"
 )
+MATH_DELIMITER_COMPAT = r"""% Stage 3: preserve legacy double-bracket names with Unicode math
+\AtBeginDocument{%
+  \ifdefined\lBrack\ifdefined\llbracket\else\let\llbracket\lBrack\fi\fi
+  \ifdefined\rBrack\ifdefined\rrbracket\else\let\rrbracket\rBrack\fi\fi
+}
+"""
 
 
 def _fontspec_latin_fallback(work: Path) -> list[str]:
@@ -91,6 +113,37 @@ def _disable_legacy_font_packages(work: Path, *, extended: bool = False) -> list
     return [f"disabled_legacy_font_packages:{count}"] if count else []
 
 
+def _brace_math_alphabet_subscripts(work: Path) -> list[str]:
+    r"""Keep math alphabet commands together as subscripts in XeLaTeX.
+
+    Some arXiv sources use ``_\mathcal{H}`` or a macro expanding to it, which
+    works with their original engine but fails with XeTeX font packages. Only
+    disposable compile copies are changed; the math expression is preserved.
+    """
+    files = [path for path in work.rglob("*")
+             if not path.is_symlink() and path.is_file() and path.suffix.lower() == ".tex"]
+    sources = {path: path.read_text(encoding="utf-8") for path in files}
+    math_macros = {match.group(1) for source in sources.values()
+                   for match in MATH_ALPHABET_MACRO.finditer(source)}
+    macro_pattern = (re.compile(r"(?<!\\)_(\\(?:" +
+                                "|".join(re.escape(name) for name in sorted(math_macros)) +
+                                r"))(?![A-Za-z@])") if math_macros else None)
+    count = 0
+    for path, source in sources.items():
+        updated, replacements = UNBRACED_MATH_ALPHABET_SUBSCRIPT.subn(
+            lambda match: "_{" + match.group(1) + "}", source
+        )
+        if macro_pattern is not None:
+            updated, macro_replacements = macro_pattern.subn(
+                lambda match: "_{" + match.group(1) + "}", updated
+            )
+            replacements += macro_replacements
+        if replacements:
+            path.write_text(updated, encoding="utf-8")
+            count += replacements
+    return [f"braced_math_alphabet_subscripts:{count}"] if count else []
+
+
 def add_chinese_support(work: Path, main_tex: str, font: str,
                         mode: str = "xecjk") -> list[str]:
     """Adjust only the disposable compile copy, never the Stage 2 draft."""
@@ -100,6 +153,7 @@ def add_chinese_support(work: Path, main_tex: str, font: str,
         raise ValueError(f"Unknown CJK mode: {mode}")
     actions = []
     special_class = (work / "mystyle.cls").is_file()
+    actions.extend(_brace_math_alphabet_subscripts(work))
     if mode in {"xecjk", "fontspec"}:
         actions.extend(_disable_legacy_font_packages(work, extended=special_class))
     if mode == "fontspec" and not special_class:
@@ -134,6 +188,10 @@ def add_chinese_support(work: Path, main_tex: str, font: str,
                               f"\\AtBeginDocument{{\\setmainfont{{{font}}}\\setsansfont{{{font}}}\\setmonofont{{{font}}}}}\n")
                 injection = ("\\usepackage{fontspec}\n" + font_setup +
                              "\\newfontfamily\\StageThreeLatinFont{Latin Modern Roman}\n"
+                             # TeX letter commands bypass the literal Unicode fallback
+                             # above (e.g. \\L{}ukasz in author names and bibliographies).
+                             '\\DeclareTextCommand{\\L}{TU}{{\\StageThreeLatinFont\\char"0141}}\n'
+                             '\\DeclareTextCommand{\\l}{TU}{{\\StageThreeLatinFont\\char"0142}}\n'
                              f"\\newfontfamily\\StageThreeSymbolFont{{{SYMBOL_FONT}}}\n"
                              "\\AtBeginDocument{\\ifdefined\\checkmark\\renewcommand{\\checkmark}{\\hbox{{\\StageThreeSymbolFont\\char\"2713}}}\\fi}\n")
             injection += ("\\XeTeXlinebreaklocale \"zh\"\n"
@@ -141,6 +199,15 @@ def add_chinese_support(work: Path, main_tex: str, font: str,
         injection += "% Stage 3: CJK support added only in temporary compilation copy\n"
         updated = updated[:match.start()] + injection + updated[match.start():]
         actions.append(f"injected_{mode}_font:{font}")
+    # acmart switches from newtxmath to unicode-math under XeLaTeX. Its
+    # Unicode delimiters have different names; retain existing definitions
+    # and wait until all math packages have loaded before adding aliases.
+    if MATH_DELIMITER_COMPAT not in updated:
+        match = BEGIN_DOCUMENT.search(updated)
+        if not match:
+            raise ValueError(f"No document start found in {main_tex}")
+        updated = updated[:match.start()] + MATH_DELIMITER_COMPAT + updated[match.start():]
+        actions.append("added_unicode_math_delimiter_compatibility")
     if updated != path.read_text(encoding="utf-8"):
         path.write_text(updated, encoding="utf-8")
     return actions
@@ -156,12 +223,28 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
 def _first_latex_error(log_path: Path) -> str | None:
     if not log_path.is_file():
         return None
-    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for index, line in enumerate(lines):
         stripped = line.strip()
         if (stripped.startswith("! ") or "LaTeX Err" in stripped or
-                re.search(r"\.tex:\d+:.*(?:error|undefined)", stripped, re.I)):
+                re.search(r"\.(?:tex|sty|cls):\d+:\s*(?!.*\bWarning\b)\S", stripped, re.I)):
+            if re.search(r"Package\s+\S+\s+Error:\s*$", stripped):
+                for next_line in lines[index + 1:index + 13]:
+                    detail = re.sub(r"^\([\w.-]+\)\s*", "", next_line.strip())
+                    if (detail and not detail.startswith(("For immediate help", "Type H", "l.",
+                                                          "...", "<to be read again>"))):
+                        return (stripped + " " + detail)[:500]
             return stripped[:500]
     return None
+
+
+def classify_missing_characters(log: str) -> dict[str, int]:
+    lines = [line for line in log.splitlines() if "Missing character:" in line]
+    nullfont = sum("font nullfont!" in line for line in lines)
+    icon_font_setup = sum(bool(ACADEMICON_SPACE_WARNING.fullmatch(line)) for line in lines)
+    return {"nullfont_warnings": nullfont,
+            "icon_font_setup_warnings": icon_font_setup,
+            "missing_glyph_warnings": len(lines) - nullfont - icon_font_setup}
 
 
 def doctor(font: str = DEFAULT_FONT, latexmk: str = "latexmk") -> dict[str, Any]:
@@ -175,6 +258,35 @@ def doctor(font: str = DEFAULT_FONT, latexmk: str = "latexmk") -> dict[str, Any]
         "cjk_font": font,
         "note": "Font and package availability are confirmed by an actual compile, not by this probe.",
     }
+
+
+def preflight_chinese_compiler(root: Path, *, font: str = DEFAULT_FONT,
+                               latexmk: str = "latexmk", timeout: int = 180) -> None:
+    """Check the actual Chinese XeLaTeX path before any paid translation call."""
+    executable, reason = probe_latexmk(latexmk)
+    if executable is None:
+        raise RuntimeError(f"中文编译环境预检未通过：{reason}")
+    if not shutil.which("xelatex"):
+        raise RuntimeError("中文编译环境预检未通过：未找到 XeLaTeX。")
+    scratch = root / "tmp"
+    scratch.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="arxiv-cjk-preflight-", dir=scratch) as name:
+        work = Path(name)
+        source = work / "main.tex"
+        source.write_text(
+            "\\documentclass{article}\n\\begin{document}中文编译预检 $x_{\\mathcal{H}}$\\end{document}\n",
+            encoding="utf-8",
+        )
+        log = work / "preflight.log"
+        result = compile_local(
+            work, [source], "main.tex", "xelatex", executable, timeout,
+            work / "preflight.pdf", log,
+            prepare_tex=lambda copy, main: add_chinese_support(copy, main, font, "fontspec"),
+            temp_root=work,
+        )
+        if result["status"] != "compiled":
+            detail = result.get("first_error") or _first_latex_error(log) or result["status"]
+            raise RuntimeError(f"中文编译环境预检未通过：{detail}。请先修复字体或 LaTeX 环境，再翻译论文。")
 
 
 def compile_paper(root: Path, paper_id: str, *, font: str = DEFAULT_FONT,
@@ -199,6 +311,10 @@ def compile_paper(root: Path, paper_id: str, *, font: str = DEFAULT_FONT,
     stage2_report = json.loads(stage2_report_path.read_text(encoding="utf-8"))
     if not stage2_report.get("complete") or stage2_report.get("source_sha256") != entry["source_sha256"]:
         raise ValueError(f"Stage 2 draft is incomplete or based on another source for {paper_id}")
+    if isinstance(stage2_report.get("segments_total"), int):
+        _, _, planned_segments = paper_plan(root, paper_id)
+        if stage2_report["segments_total"] != len(planned_segments):
+            raise ValueError(f"Stage 2 draft is stale for {paper_id}; resume translation before compiling")
     translated = draft_dir / "translated"
     if translated.is_symlink() or not translated.is_dir() or translated.resolve().parent != draft_dir.resolve():
         raise ValueError("Stage 2 translated source directory is missing or unsafe")
@@ -250,7 +366,7 @@ def compile_paper(root: Path, paper_id: str, *, font: str = DEFAULT_FONT,
         "cached": False,
     }
     compiler_log = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
-    report["missing_glyph_warnings"] = compiler_log.count("Missing character:")
+    report.update(classify_missing_characters(compiler_log))
     report["overfull_hbox_warnings"] = compiler_log.count("Overfull \\hbox")
     if result["status"] == "compiled" and report["missing_glyph_warnings"]:
         report["status"] = "validation_failed"
